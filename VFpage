@@ -1,0 +1,192 @@
+<apex:page controller="CSVOpportunityImportController" lightningStyleSheets="true" showHeader="false" sidebar="false" applyHtmlTag="false" applyBodyTag="false" docType="html-5.0">
+    <html xmlns="http://www.w3.org/2000/svg" xmlns:xlink="http://www.w3.org/1999/xlink" lang="en">
+        <head>
+            <meta charset="utf-8" />
+            <meta http-equiv="x-ua-compatible" content="ie=edge" />
+            <title>Upload CSV File</title>
+            <meta name="viewport" content="width=device-width, initial-scale=1" />
+            <apex:slds />
+        </head>
+        <body>
+            <div class="slds-scope">
+                <apex:form >
+                    <apex:pagemessages />
+                    <apex:pageBlock >
+                        <div class="slds-box slds-box_small">
+                            <div class="slds-align_absolute-center">
+                                <label class="slds-form-element__label" for="form-element-01">Select File:</label>
+                                <div class="slds-box slds-box_small">
+                                    <apex:inputFile value="{!contentFile}" filename="{!nameFile}" />
+                                </div>
+                            </div>
+                            <div class="slds-align_absolute-center" style="padding:12px">
+                                <apex:commandButton action="{!ReadFile}" value="Upload" id="theButton" style="width:70px;" />
+                            </div>
+                        </div>
+                    </apex:pageBlock>
+                </apex:form>
+            </div>
+        </body>
+    </html>
+</apex:page>
+
+-----------------------------------Controller------------------------------
+
+public class CSVOpportunityImportController {
+    public String nameFile { get; set; }
+    public Blob contentFile { get; set; }
+
+    public void ReadFile() {
+        try {
+            String csvString = contentFile.toString();
+            List<String> lines = csvString.split('\n');
+            List<String[]> dataRows = new List<String[]>();
+
+            // Collect data rows for bulk processing
+            for (Integer i = 1; i < lines.size(); i++) {
+                String[] inputValues = lines[i].split(',');
+                if (inputValues.size() == 2) {
+                    dataRows.add(inputValues);
+                }
+            }
+
+            // Process data in bulk to reduce DML operations
+            processCSVData(dataRows);
+
+            // Redirect to a success page
+            PageReference successPage = new PageReference('/apex/SuccessFullmessage');
+            successPage.setRedirect(true);
+            ApexPages.currentPage().setRedirect(true);
+        } catch (Exception e) {
+            ApexPages.addMessage(new ApexPages.Message(ApexPages.Severity.ERROR, 'An error has occurred reading the CSV file: ' + e.getMessage()));
+        }
+    }
+
+    // Process CSV data in bulk
+    private void processCSVData(List<String[]> dataRows) {
+        List<Contact> contactsToUpdate = new List<Contact>();
+        List<Product2> productsToInsert = new List<Product2>();
+        List<Opportunity> opportunitiesToInsert = new List<Opportunity>();
+        List<OpportunityContactRole> opportunityContactRolesToInsert = new List<OpportunityContactRole>();
+        List<PricebookEntry> pricebookEntriesToInsert = new List<PricebookEntry>();
+        List<OpportunityLineItem> opportunityLineItemsToInsert = new List<OpportunityLineItem>();
+
+        // Get the standard Pricebook2
+        Pricebook2 standardPricebook = [
+            SELECT Id
+            FROM Pricebook2
+            WHERE IsStandard = true
+            LIMIT 1
+        ];
+
+        for (String[] inputValues : dataRows) {
+            String email = inputValues[0];
+            String productName = inputValues[1];
+
+            // Find the Contact with an email address that partially matches the specified email address
+            List<Contact> contacts = [
+                SELECT Id, AccountId, (SELECT Id FROM Opportunities)
+                FROM Contact
+                WHERE Email LIKE :('%' + email + '%')
+                LIMIT 1
+            ];
+
+            if (!contacts.isEmpty()) {
+                Contact contact = contacts[0];
+
+                Opportunity opportunity;
+                if (!contact.Opportunities.isEmpty()) {
+                    opportunity = contact.Opportunities[0];
+                } else {
+                    // Create a new Opportunity for the Contact's Account if it does not have any existing Opportunities
+                    opportunity = new Opportunity(
+                        Name = productName, // Set the name of the Opportunity
+                        StageName = 'Prospecting',
+                        CloseDate = Date.today() + 30,
+                        Pricebook2Id = standardPricebook.Id,
+                        AccountId = contact.AccountId
+                    );
+                    opportunitiesToInsert.add(opportunity);
+                }
+
+                // Associate the Contact with the Opportunity using an OpportunityContactRole
+                OpportunityContactRole ocr = new OpportunityContactRole(
+                    OpportunityId = opportunity.Id,
+                    ContactId = contact.Id,
+                    Role = 'Decision Maker'
+                );
+                opportunityContactRolesToInsert.add(ocr);
+
+                // Check if a Product2 already exists for the specified product name
+                List<Product2> products = [
+                    SELECT Id, Name, IsActive, Family
+                    FROM Product2
+                    WHERE Name LIKE :('%' + productName + '%')
+                    LIMIT 1
+                ];
+
+                Product2 product;
+                if (!products.isEmpty()) {
+                    product = products[0];
+                } else {
+                    // Create a new Product2 for the specified product name if it does not already exist
+                    product = new Product2(
+                        Name = productName,
+                        IsActive = true,
+                        Family = 'Your Product Family'
+                    );
+                    productsToInsert.add(product);
+                }
+
+                // Check if a PricebookEntry already exists for this product in the standard Pricebook2
+                List<PricebookEntry> pricebookEntries = [
+                    SELECT Id, UnitPrice, IsActive, Product2Id, Pricebook2Id
+                    FROM PricebookEntry
+                    WHERE Product2Id = :product.Id AND Pricebook2Id = :standardPricebook.Id
+                    LIMIT 1
+                ];
+
+                PricebookEntry pricebookEntry;
+                if (!pricebookEntries.isEmpty()) {
+                    pricebookEntry = pricebookEntries[0];
+                } else {
+                    // Create a new PricebookEntry for this product in the standard Pricebook2 if it does not already exist
+                    pricebookEntry = new PricebookEntry(
+                        Product2Id = product.Id,
+                        Pricebook2Id = standardPricebook.Id,
+                        UnitPrice = 100.0,
+                        IsActive = true
+                    );
+                    pricebookEntriesToInsert.add(pricebookEntry);
+                }
+
+                // Create a new OpportunityLineItem for this product in the Contact's Opportunity
+                OpportunityLineItem lineItem = new OpportunityLineItem(
+                    OpportunityId = opportunity.Id,
+                    Quantity = 1,
+                    UnitPrice = pricebookEntry.UnitPrice,
+                    PricebookEntryId = pricebookEntry.Id
+                );
+                opportunityLineItemsToInsert.add(lineItem);
+
+                // Update the contact's Opportunities list with the new Opportunity
+                // Only update the Opportunities if the Opportunity is inserted successfully
+                if (opportunity.Id == null) {
+                    contact.Opportunities.add(opportunity);
+                    contactsToUpdate.add(contact);
+                }
+            } else {
+                // Handle the case where no Contact was found
+                ApexPages.addMessage(new ApexPages.Message(ApexPages.Severity.ERROR, 'No Contact found with email address: ' + email));
+            }
+        }
+
+        // Bulk DML operations
+        insert productsToInsert;
+        insert opportunitiesToInsert;
+        insert opportunityContactRolesToInsert;
+        insert pricebookEntriesToInsert;
+        insert opportunityLineItemsToInsert;
+        update contactsToUpdate;
+    }
+}
